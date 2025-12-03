@@ -1,0 +1,61 @@
+[Unit]
+Description=vLLM API Server for %i
+After=network.target
+
+[Service]
+Type=simple
+
+# ← 実行ユーザを DGX Spark の実ユーザへ
+User=jd
+
+# WorkingDirectory は固定にしておき、実際の vLLM ソースへは ExecStart で cd する
+WorkingDirectory=/
+
+# ★ Blackwell / CUDA13 用 ptxas を強制
+Environment="TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas"
+
+# ★ Blackwell 用 compute capability
+Environment="TORCH_CUDA_ARCH_LIST=12.1a"
+
+# ★ python/venv PATH が systemd 内で潰れるのを防ぐ
+#   vLLM_ENV が .env に定義されていれば ExecStart 内で PATH に追加する
+Environment="PATH=/usr/local/cuda/bin:/usr/bin:/bin"
+
+# ★ CUDA ランタイムの参照先
+Environment="LD_LIBRARY_PATH=/usr/local/cuda/lib64"
+
+# .env ファイル置き場を指定
+EnvironmentFile=/home/jd/control/vllm/systemd_units/env/%i.env
+
+Restart=always
+RestartSec=5
+
+ExecStart=/bin/bash -c '\
+# --- vLLM 実体の選択（.env から上書き可能） -------------------------- \
+VLLM_ENV_DEFAULT="/home/jd/llm/vllm-spark/.venv"; \
+VLLM_WORKDIR_DEFAULT="/home/jd/llm/vllm-spark/vllm"; \
+VLLM_ENV="${VLLM_ENV:-$VLLM_ENV_DEFAULT}"; \
+VLLM_WORKDIR="${VLLM_WORKDIR:-$VLLM_WORKDIR_DEFAULT}"; \
+VLLM_PYTHON="${VLLM_PYTHON:-$VLLM_ENV/bin/python}"; \
+export PATH="$VLLM_ENV/bin:$PATH"; \
+cd "$VLLM_WORKDIR"; \
+# ------------------------------------------------------------------ \
+ARGS="--model ${MODEL_PATH:-} \
+--host ${HOST:-0.0.0.0} --port ${PORT:-8000} \
+--dtype ${DTYPE:-auto} --max-model-len ${MAX_MODEL_LEN:-8192} \
+--gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.90} \
+--max-num-seqs ${MAX_NUM_SEQS:-8} --tensor-parallel-size ${TENSOR_PARALLEL_SIZE:-1}"; \
+if [[ -n "${QUANTIZATION:-}" && "${QUANTIZATION:-None}" != "None" ]]; then \
+  ARGS="$ARGS --quantization ${QUANTIZATION}"; \
+fi; \
+if [[ -n "${KV_CACHE_DTYPE:-}" ]]; then \
+  ARGS="$ARGS --kv-cache-dtype ${KV_CACHE_DTYPE}"; \
+fi; \
+echo "[vLLM start] $VLLM_PYTHON -m vllm.entrypoints.openai.api_server $ARGS"; \
+exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server $ARGS \
+'
+
+[Install]
+WantedBy=multi-user.target
+
+

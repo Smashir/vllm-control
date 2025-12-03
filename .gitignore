@@ -1,0 +1,24 @@
+# Python 仮想環境
+.venv/
+
+# systemd 実行環境設定（モデルごとの .env）
+systemd_units/env/
+
+# 一時ファイル / キャッシュ
+*.pyc
+__pycache__/
+*.log
+logs/
+.tmp/
+.cache/
+
+# OS / Editor 系
+.DS_Store
+Thumbs.db
+
+# バックアップ
+*~
+*.swp
+
+# Local overrides
+local_*.sh
