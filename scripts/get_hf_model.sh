@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =======================================================
-# hf_get_model.sh : 高速・安全 Hugging Face モデルダウンロード (vllm_env対応)
-# 自動: hf が無ければ vllm_env に自動インストール
+# hf_get_model.sh : 高速・安全 Hugging Face モデルダウンロード
+# 自動: hf が無ければ自動インストール
 # =======================================================
 set -e
 
@@ -35,13 +35,13 @@ if [[ ! -x "$HF_CMD" ]]; then
   echo "   → pip install -U huggingface_hub hf_transfer"
 
   # vllm_env が存在することを確認
-  if [[ ! -d "$VLLM_ENV" ]]; then
-    echo "❌ Error: vLLM environment not found at $VLLM_ENV"
+  if [[ ! -d "$VENV" ]]; then
+    echo "❌ Error: vLLM environment not found at $VENV"
     exit 1
   fi
 
   # 自動インストール
-  "$VLLM_ENV/bin/python" -m pip install -U huggingface_hub
+  "$VENV/bin/python" -m pip install -U huggingface_hub
 
   # もう一度確認
   if [[ ! -x "$HF_CMD" ]]; then
@@ -50,12 +50,26 @@ if [[ ! -x "$HF_CMD" ]]; then
   fi
 
   # hf_transfer があるか確認
-  if ! "$VLLM_ENV/bin/python" -c "import hf_transfer" 2>/dev/null; then
+  if ! "$VENV/bin/python" -c "import hf_transfer" 2>/dev/null; then
     echo "❌ Error: hf_transfer がインストールされていません"
     # 自動インストール
-    "$VLLM_ENV/bin/python" -m pip install -U hf_transfer
+    "$VENV/bin/python" -m pip install -U hf_transfer
   fi
 
+fi
+
+
+# =======================================================
+# 🔐 HF ログインチェック（gated model のため）
+# =======================================================
+echo "🔐 Checking HuggingFace authentication..."
+
+if ! "$HF_CMD" auth whoami >/dev/null 2>&1; then
+  echo "⚠️  You are NOT logged in to HuggingFace."
+  echo "   → Running 'hf auth login' ..."
+  "$HF_CMD" auth login
+else
+  echo "✔ Logged in as: $("$HF_CMD" auth whoami)"
 fi
 
 # =======================================================
@@ -65,20 +79,36 @@ MODEL_DIR_NAME=$(basename "$MODEL_ID" | tr '[:upper:]' '[:lower:]' | tr '_' '-' 
 MODEL_PATH="${BASE_DIR}/${MODEL_DIR_NAME}"
 
 echo "==============================="
-echo "📦 Hugging Face モデル取得 (最適化版)"
+echo "📦 Hugging Face モデル取得"
 echo "==============================="
 echo "Model ID:     ${MODEL_ID}"
 echo "Save to:      ${MODEL_PATH}"
-echo "Python Env:   ${VLLM_ENV}"
+echo "Python Env:   ${VENV}"
 echo "-------------------------------"
 
 mkdir -p "${MODEL_PATH}"
+
+# =======================================================
+# wandb フォルダ存在チェック（404 防止）
+# =======================================================
+echo "🔍 Checking presence of wandb/ ..."
+
+if curl -s https://huggingface.co/api/models/${MODEL_ID}/tree \
+    | grep -q '"path": "wandb/' ; then
+  echo "→ wandb/ FOUND. Will exclude it."
+  EXCLUDE_WANDB=" wandb/*"
+else
+  echo "→ wandb/ NOT found. Will NOT exclude it."
+  EXCLUDE_WANDB=""
+fi
+
+
 
 # === 実行 ===
 echo "🚀 Downloading with parallel hf-transfer..."
 "${HF_CMD}" download "${MODEL_ID}" \
   --local-dir "${MODEL_PATH}" \
-  --exclude "training/*" "wandb/*"
+  --exclude "training/*${EXCLUDE_WANDB}"
 
 echo "✅ Download complete."
 echo "📁 Saved to: ${MODEL_PATH}"

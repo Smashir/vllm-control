@@ -22,4 +22,10 @@ MODEL_ROOT="${REAL_HOME}/models"
 UNIT_DIR="${ROOT}/systemd_units"
 ENV_DIR="${UNIT_DIR}/env"
 
+# ★vLLM 本体が入っている「解析用」の .venv
+#   必要ならここはあなたの環境に合わせて変える
+VLLM_ANALYZER_ENV="${REAL_HOME}/llm/vllm-spark/.venv"
+VLLM_ANALYZER_PYTHON="${VLLM_ANALYZER_ENV}/bin/python"
 
+# 解析用スクリプトのパス
+VLLM_ANALYZER_SCRIPT="${SCRIPTS_ROOT}/get_max_model_len.py"

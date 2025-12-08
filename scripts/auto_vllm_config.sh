@@ -23,8 +23,11 @@ source "$(dirname "$0")/_paths.sh"
 DEFAULT_HOST="0.0.0.0"
 DEFAULT_PORT="8000"
 DEFAULT_GPU_UTIL="0.90"
-DEFAULT_MAX_LEN="16384"
+DEFAULT_MAX_LEN="None"
 DEFAULT_NUM_SEQS="8"
+
+# KV cache VRAM 見積りにだけ使う内部用の長さ（env には書かない）
+DEFAULT_KV_EST_LEN=16384
 
 GIB=$((1024 * 1024 * 1024))
 
@@ -100,6 +103,53 @@ kv_bytes_upper_bound() {
   awk -v L="$L" -v H="$H_KV" -v D="$D" -v B="$bpe" -v T="$max_len" -v N="$num_seqs" \
       'BEGIN{print 2*L*H*D*B*T*N}'
 }
+
+# ------------------------------------------------------------
+# モデルの MAX_MODEL_LEN を決定する
+#   1. config.json からそれっぽいフィールドを jq で読む
+#   2. ダメなら get_max_model_len.py で vLLM から推定
+#   3. それでもダメなら "None" を返す
+# ------------------------------------------------------------
+get_max_model_len() {
+  local model_dir="$1"
+  local cfg="$model_dir/config.json"
+  local max_len=""
+
+  # 1) config.json から読む（jq がある場合）
+  if command -v jq >/dev/null 2>&1 && [[ -f "$cfg" ]]; then
+    max_len=$(jq -r '
+      .max_model_len //
+      .max_position_embeddings //
+      .text_config.max_position_embeddings //
+      .rope_scaling.max_position_embeddings //
+      .n_positions //
+      .max_sequence_length //
+      .seq_length //
+      "unset"
+    ' "$cfg" 2>/dev/null || echo "unset")
+
+    if [[ "$max_len" != "null" && "$max_len" != "unset" && "$max_len" =~ ^[0-9]+$ ]]; then
+      echo "$max_len"
+      return 0
+    fi
+  fi
+
+  # 2) vLLM 側から推定（get_max_model_len.py）
+  if [[ -n "${VLLM_ANALYZER_PYTHON:-}" && -x "${VLLM_ANALYZER_PYTHON}" \
+     && -n "${VLLM_ANALYZER_SCRIPT:-}" && -f "${VLLM_ANALYZER_SCRIPT}" ]]; then
+    echo "[auto_vllm_config] config.json から max length を取得できなかったため vLLM から推定します..." >&2
+    if max_len="$("${VLLM_ANALYZER_PYTHON}" "${VLLM_ANALYZER_SCRIPT}" "${model_dir}" 2>/dev/null)"; then
+      if [[ "$max_len" =~ ^[0-9]+$ ]]; then
+        echo "$max_len"
+        return 0
+      fi
+    fi
+  fi
+
+  # 3) どうしてもダメなら "None"
+  echo "None"
+}
+
 
 # ------------------------------------------------------------
 # .env ファイル生成
@@ -181,7 +231,10 @@ generate_env() {
   local host="$DEFAULT_HOST"
   local port="$DEFAULT_PORT"
   local gpu_util="$DEFAULT_GPU_UTIL"
-  local max_len="$DEFAULT_MAX_LEN"
+  #local max_len="$DEFAULT_MAX_LEN"
+  local max_len=$(get_max_model_len "$path")
+  echo "[INFO] MAX_MODEL_LEN detected from config.json: ${max_len}"
+
   local num_seqs="$DEFAULT_NUM_SEQS"
 
   local bytes_per_param; bytes_per_param=$(bytes_per_param_from_dtype_quant "$dtype" "$quant")
@@ -192,7 +245,17 @@ generate_env() {
   echo "[INFO] dtype=${dtype}, kv_cache_dtype=${kv_dtype}, quant=${quant}"
   echo "[INFO] Weights: ${weights_gib} GiB"
 
-  local kv_bytes; kv_bytes=$(kv_bytes_upper_bound "$num_layers" "$heads_kv" "$head_dim" "$kv_dtype" "$max_len" "$num_seqs")
+  # KV cache VRAM 見積り用の長さ（数値が取れなければ内部デフォルトを使う）
+  local kv_est_len="$max_len"
+  if ! [[ "$kv_est_len" =~ ^[0-9]+$ ]]; then
+    kv_est_len="$DEFAULT_KV_EST_LEN"
+  fi
+
+  local kv_bytes
+  kv_bytes=$(kv_bytes_upper_bound \
+      "$num_layers" "$heads_kv" "$head_dim" "$kv_dtype" \
+      "$kv_est_len" "$num_seqs")
+
   local kv_gib=$(awk -v b="$kv_bytes" -v g="$GIB" 'BEGIN{printf "%.3f", b/g}')
 
   generate_env_file "$model" "$dtype" "$kv_dtype" "$quant" "$host" "$port" "$gpu_util" "$max_len" "$num_seqs" "$weights_gib" "$kv_gib" "$vram_gib"
@@ -212,7 +275,8 @@ vLLM 非対応値 (fp16 など) は自動で警告・フォールバック。
   auto_vllm_config.sh <モデル名>
 
 出力:
-  /home/jd/modules/dgx-spark-vllm/systemd_units/env/<モデル名>.env
+  ${ENV_DIR}/<モデル名>.env
+
 HELP
   exit 0
 fi

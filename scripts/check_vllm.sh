@@ -107,7 +107,7 @@ echo "  → HTTP ${STATUS_CODE}"
 if [[ "$DIAG" == "--diag" ]]; then
     echo
     echo "【journalctl 最新ログ（100行）】"
-    sudo journalctl -u "$SVC" -n 100 --no-pager | tail -n 100
+    sudo journalctl -u "$SVC" -n 300 --no-pager | tail -n 300
 fi
 
 echo

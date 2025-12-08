@@ -36,6 +36,7 @@ vllmctl - vLLM モデル管理コマンド
   config <model>      自動環境設定を実行 (auto_vllm_config 連携)
   fetch <repo> [name] Hugging Face からモデルを取得
   remove <model>      モデルを削除
+  status              全モデルの稼働状況を表示
   help                このヘルプを表示
 EOF
 }
@@ -95,6 +96,9 @@ case "$1" in
         [[ -z "$2" ]] && { echo "削除するモデル名を指定してください。"; exit 1; }
         bash "${SCRIPTS_DIR}/rm_model.sh" "$2"
         ;;
+    status)
+        bash "${SCRIPTS_DIR}/status_vllm.sh"
+        ;;
     help|--help|-h)
         print_help
         ;;
@@ -102,4 +106,6 @@ case "$1" in
         print_help
         ;;
 esac
+
+
 
