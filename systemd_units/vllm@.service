@@ -51,6 +51,7 @@ fi; \
 if [[ -n "${KV_CACHE_DTYPE:-}" ]]; then \
   ARGS="$ARGS --kv-cache-dtype ${KV_CACHE_DTYPE}"; \
 fi; \
+if [[ -n "${EXTRA_ARGS:-}" ]]; then ARGS="$ARGS $EXTRA_ARGS"; fi; \
 echo "[vLLM start] $VLLM_PYTHON -m vllm.entrypoints.openai.api_server $ARGS"; \
 exec "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server $ARGS \
 '

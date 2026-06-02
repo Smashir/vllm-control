@@ -22,3 +22,10 @@ Thumbs.db
 
 # Local overrides
 local_*.sh
+
+# Local handoff/export workspace
+.handoff/
+
+
+# Script/manual backups
+*.bak-*

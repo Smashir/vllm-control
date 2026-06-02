@@ -86,7 +86,7 @@ case "$1" in
         ;;
     config)
         [[ -z "$2" ]] && { echo "モデル名を指定してください。"; exit 1; }
-        bash "${SCRIPTS_DIR}/auto_vllm_config.sh" "$2"
+        bash "${SCRIPTS_DIR}/auto_vllm_config.sh" "$2" "${@:3}"
         ;;
     fetch)
         [[ -z "$2" ]] && { echo "モデルリポジトリ名を指定してください。"; exit 1; }
