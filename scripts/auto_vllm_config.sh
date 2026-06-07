@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
-# auto_vllm_config.sh v6.7
+# auto_vllm_config.sh v6.8
 # ------------------------------------------------------------
 # ・config.json の内容を最優先で dtype / quantization / kv-cache-dtype に反映
 # ・vLLM 非対応値 (例: fp16) のみ警告付きで安全フォールバック
 # ・VRAM 推定を行い .env ファイルを生成
 # ・MTP / trust-remote-code / vLLM実行環境 / tiktoken cache を自動反映
-# ・共存運用向けにGPU予約量とKV cache上限を自動反映
+# ・weights + KV cache + overhead + margin から GPU utilization を自動推定
 # ============================================================
 
 set -euo pipefail
@@ -32,11 +32,33 @@ DEFAULT_AUTO_TRUST_REMOTE_CODE="${VLLM_AUTO_TRUST_REMOTE_CODE:-1}"
 DEFAULT_AUTO_MTP="${VLLM_AUTO_MTP:-1}"
 DEFAULT_AUTO_FLASHINFER_AUTOTUNE="${VLLM_AUTO_FLASHINFER_AUTOTUNE:-0}"
 
+# Reasoning parser 自動付与
+#   VLLM_REASONING_PARSER=auto:
+#     既知 reasoning 系列なら parser を自動付与。未知/非reasoning なら付与しない。
+#   VLLM_REASONING_PARSER=none:
+#     reasoning parser を付与しない。
+#   VLLM_REASONING_PARSER=qwen3 など:
+#     明示 parser を強制付与。
+#
+#   VLLM_REASONING_DEFAULT=auto:
+#     系列ごとの安全既定値。Qwen3 は thinking off。
+#   VLLM_REASONING_DEFAULT=none:
+#     default-chat-template-kwargs を付与しない。
+#   VLLM_REASONING_DEFAULT=off/on:
+#     可能な範囲で thinking 既定値を明示する。
+DEFAULT_REASONING_PARSER="${VLLM_REASONING_PARSER:-auto}"
+DEFAULT_REASONING_DEFAULT="${VLLM_REASONING_DEFAULT:-auto}"
+
+
 # 共存運用向け。Style-Bert-VITS2 等のためにVRAMを残し、
 # vLLMのKV cacheを必要量へ制限する。
 DEFAULT_RESERVED_VRAM_GIB="${VLLM_RESERVED_VRAM_GIB:-32}"
 DEFAULT_KV_CACHE_GIB="${VLLM_KV_CACHE_GIB:-8}"
 DEFAULT_AUTO_KV_CACHE_BYTES="${VLLM_AUTO_KV_CACHE_BYTES:-1}"
+DEFAULT_RUNTIME_OVERHEAD_GIB="${VLLM_RUNTIME_OVERHEAD_GIB:-6}"
+DEFAULT_MEMORY_MARGIN_GIB="${VLLM_MEMORY_MARGIN_GIB:-4}"
+DEFAULT_GPU_UTIL_MIN="${VLLM_GPU_UTIL_MIN:-0.10}"
+DEFAULT_GPU_UTIL_MAX="${VLLM_GPU_UTIL_MAX:-0.90}"
 
 # KV cache VRAM 見積りにだけ使う内部用の長さ（env には書かない）
 DEFAULT_KV_EST_LEN=16384
@@ -65,6 +87,42 @@ calc_gpu_util_with_reserve() {
     }
   '
 }
+
+
+calc_gpu_util_from_estimate() {
+  local vram_gib="$1"
+  local weights_gib="$2"
+  local kv_budget_gib="$3"
+  local overhead_gib="$4"
+  local margin_gib="$5"
+  local min_util="$6"
+  local max_util="$7"
+
+  awk -v total="$vram_gib" \
+      -v weights="$weights_gib" \
+      -v kv="$kv_budget_gib" \
+      -v overhead="$overhead_gib" \
+      -v margin="$margin_gib" \
+      -v min_util="$min_util" \
+      -v max_util="$max_util" '
+    BEGIN {
+      if (total <= 0) {
+        printf "0.90";
+        exit;
+      }
+      need = weights + kv + overhead + margin;
+      util = need / total;
+      if (util > max_util) util = max_util;
+      if (util < min_util) util = min_util;
+      printf "%.2f", util;
+    }
+  '
+}
+
+calc_gpu_need_gib() {
+  awk -v weights="$1" -v kv="$2" -v overhead="$3" -v margin="$4" 'BEGIN{printf "%.2f", weights + kv + overhead + margin}'
+}
+
 
 # ------------------------------------------------------------
 # GPU情報取得
@@ -212,17 +270,189 @@ detect_mtp_support() {
   echo 0
 }
 
+has_reasoning_chat_template() {
+  local dir="$1"
+  local tok_cfg="$dir/tokenizer_config.json"
+  local gen_cfg="$dir/generation_config.json"
+  local text=""
+
+  if [[ -f "$tok_cfg" ]]; then
+    text="$(
+      jq -r '
+        [
+          (.chat_template // ""),
+          (.tokenizer_class // ""),
+          (.eos_token // ""),
+          ((.additional_special_tokens // []) | join(" "))
+        ]
+        | map(if type == "string" then . else tostring end)
+        | join("\n")
+      ' "$tok_cfg" 2>/dev/null || true
+    )"
+  fi
+
+  if [[ -f "$gen_cfg" ]]; then
+    text="${text}
+$(
+      jq -r '[.. | strings] | join("\n")' "$gen_cfg" 2>/dev/null || true
+    )"
+  fi
+
+  # ここが「reasoning model / thinking template らしさ」の確認。
+  # model名だけでは判定しない。
+  if printf '%s\n' "$text" | grep -Eiq 'enable_thinking|reasoning_effort|reasoning_content|<think>|</think>|<\|channel\|>analysis|<\|start\|>assistant<\|channel\|>analysis'; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+detect_known_reasoning_parser_mapping() {
+  local model="$1" model_type="$2" architectures="$3"
+  local key
+  key="$(printf '%s %s %s' "$model" "$model_type" "$architectures" | tr '[:upper:]' '[:lower:]')"
+
+  case "$key" in
+    *qwen3*|*qwen3_5*|*qwen3-5*)
+      echo "qwen3"
+      ;;
+    *deepseek*r1*|*deepseek-r1*|*qwq*)
+      echo "deepseek_r1"
+      ;;
+    *gemma*4*|*gemma-4*)
+      echo "gemma4"
+      ;;
+    *deepseek*v3.1*|*deepseek-v3.1*|*deepseek_v3*)
+      echo "deepseek_v3"
+      ;;
+    *granite*3.2*|*granite-3.2*)
+      echo "granite"
+      ;;
+    *glm*4.5*|*glm-4.5*)
+      echo "glm45"
+      ;;
+    *hunyuan*a13b*)
+      echo "hunyuan_a13b"
+      ;;
+    *ernie*4.5*|*ernie-4.5*)
+      echo "ernie45"
+      ;;
+    *minimax*m2*|*minimax-m2*)
+      echo "minimax_m2_append_think"
+      ;;
+    *cohere*command*a*)
+      echo "cohere_command3"
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
+detect_reasoning_parser() {
+  local model_dir="$1" model="$2" model_type="$3" architectures="$4"
+  local requested="$DEFAULT_REASONING_PARSER"
+
+  case "$requested" in
+    ""|"none"|"off"|"0")
+      echo ""
+      return 0
+      ;;
+    "auto")
+      ;;
+    *)
+      # 明示指定された場合だけ、ユーザーの責任で強制付与する。
+      echo "$requested"
+      return 0
+      ;;
+  esac
+
+  local has_template
+  has_template="$(has_reasoning_chat_template "$model_dir")"
+
+  if [[ "$has_template" != "1" ]]; then
+    echo ""
+    return 0
+  fi
+
+  detect_known_reasoning_parser_mapping "$model" "$model_type" "$architectures"
+}
+
+build_reasoning_default_arg() {
+  local parser="$1"
+  local mode="$DEFAULT_REASONING_DEFAULT"
+
+  if [[ -z "$parser" ]]; then
+    echo ""
+    return 0
+  fi
+
+  case "$mode" in
+    ""|"none"|"0")
+      echo ""
+      return 0
+      ;;
+    "auto")
+      case "$parser" in
+        qwen3)
+          echo '--default-chat-template-kwargs {"enable_thinking":false}'
+          ;;
+        *)
+          echo ""
+          ;;
+      esac
+      ;;
+    "off")
+      case "$parser" in
+        qwen3|gemma4)
+          echo '--default-chat-template-kwargs {"enable_thinking":false}'
+          ;;
+        deepseek_v3|granite|glm45|holo2)
+          echo '--default-chat-template-kwargs {"thinking":false}'
+          ;;
+        *)
+          echo ""
+          ;;
+      esac
+      ;;
+    "on")
+      case "$parser" in
+        qwen3|gemma4)
+          echo '--default-chat-template-kwargs {"enable_thinking":true}'
+          ;;
+        deepseek_v3|granite|glm45|holo2)
+          echo '--default-chat-template-kwargs {"thinking":true}'
+          ;;
+        *)
+          echo ""
+          ;;
+      esac
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
 escape_env_arg() {
   # systemd EnvironmentFile の double-quoted value に入れるため、JSON内の " を escape する。
   printf '%s' "$1" | sed 's/"/\\"/g'
 }
 
 build_extra_args() {
-  local trust_remote_code="$1" has_mtp="$2" flashinfer_autotune="$3" max_num_batched_tokens="$4" kv_cache_bytes="$5"
+  local trust_remote_code="$1" has_mtp="$2" flashinfer_autotune="$3" max_num_batched_tokens="$4" kv_cache_bytes="$5" reasoning_parser="$6" reasoning_default_arg="$7"
   local args=""
 
   if [[ "$trust_remote_code" == "1" ]]; then
     args="$args --trust-remote-code"
+  fi
+
+  if [[ -n "$reasoning_parser" ]]; then
+    args="$args --reasoning-parser ${reasoning_parser}"
+  fi
+
+  if [[ -n "$reasoning_default_arg" ]]; then
+    args="$args ${reasoning_default_arg}"
   fi
 
   if [[ "$has_mtp" == "1" ]]; then
@@ -261,6 +491,7 @@ generate_env_file() {
 # Auto-generated vLLM Environment File (v6.7)
 # ============================================================
 MODEL_PATH=${MODEL_ROOT}/${model}
+SERVED_MODEL_NAME=${model}
 HOST=${host}
 PORT=${port}
 DTYPE=${dtype}
@@ -344,10 +575,6 @@ generate_env() {
 
   local host="$DEFAULT_HOST"
   local port="$DEFAULT_PORT"
-  local gpu_util
-  gpu_util=$(calc_gpu_util_with_reserve "$vram_gib" "$DEFAULT_RESERVED_VRAM_GIB")
-  echo "[INFO] GPU_MEMORY_UTILIZATION selected=${gpu_util} (reserved=${DEFAULT_RESERVED_VRAM_GIB} GiB)"
-  #local max_len="$DEFAULT_MAX_LEN"
   local raw_max_len=$(get_max_model_len "$path")
   local max_len="$raw_max_len"
   if [[ "$max_len" =~ ^[0-9]+$ && "$DEFAULT_SAFE_MAX_LEN" =~ ^[0-9]+$ && "$max_len" -gt "$DEFAULT_SAFE_MAX_LEN" ]]; then
@@ -370,11 +597,31 @@ generate_env() {
   local has_mtp; has_mtp=$(detect_mtp_support "$path" "$mtp_layers")
   local max_num_batched_tokens="${VLLM_MAX_NUM_BATCHED_TOKENS:-}"
   local kv_cache_bytes=""
+
   if [[ "${DEFAULT_AUTO_KV_CACHE_BYTES}" == "1" ]]; then
     kv_cache_bytes=$(gib_to_bytes "$DEFAULT_KV_CACHE_GIB")
   fi
-  local extra_args_raw; extra_args_raw=$(build_extra_args "$DEFAULT_AUTO_TRUST_REMOTE_CODE" "$has_mtp" "$DEFAULT_AUTO_FLASHINFER_AUTOTUNE" "$max_num_batched_tokens" "$kv_cache_bytes")
-  local extra_args; extra_args=$(escape_env_arg "$extra_args_raw")
+
+  local trust_remote_code="$DEFAULT_AUTO_TRUST_REMOTE_CODE"
+
+  local reasoning_parser
+  reasoning_parser=$(detect_reasoning_parser "$path" "$model" "$model_type" "$architectures")
+
+  local reasoning_default_arg
+  reasoning_default_arg=$(build_reasoning_default_arg "$reasoning_parser")
+
+  if [[ -n "$reasoning_parser" ]]; then
+    echo "[INFO] reasoning_parser=${reasoning_parser}, reasoning_default=${DEFAULT_REASONING_DEFAULT}"
+  elif [[ "$DEFAULT_REASONING_PARSER" == "auto" ]]; then
+    echo "[INFO] reasoning_parser=none (auto: no reasoning chat_template + known parser mapping match)"
+  fi
+
+  local extra_args_raw
+  extra_args_raw=$(build_extra_args "$trust_remote_code" "$has_mtp" "$DEFAULT_AUTO_FLASHINFER_AUTOTUNE" "$max_num_batched_tokens" "$kv_cache_bytes" "$reasoning_parser" "$reasoning_default_arg")
+
+  local extra_args
+  extra_args=$(escape_env_arg "$extra_args_raw")
+
   echo "[INFO] mtp_detected=${has_mtp}, kv_cache_gib=${DEFAULT_KV_CACHE_GIB}, kv_cache_bytes=${kv_cache_bytes}, EXTRA_ARGS=${extra_args_raw}"
 
   # KV cache VRAM 見積り用の長さ（数値が取れなければ内部デフォルトを使う）
@@ -390,6 +637,19 @@ generate_env() {
 
   local kv_gib=$(awk -v b="$kv_bytes" -v g="$GIB" 'BEGIN{printf "%.3f", b/g}')
 
+  local kv_budget_gib="$kv_gib"
+  if [[ "${DEFAULT_AUTO_KV_CACHE_BYTES}" == "1" ]]; then
+    kv_budget_gib="$DEFAULT_KV_CACHE_GIB"
+  fi
+
+  local gpu_need_gib
+  gpu_need_gib=$(calc_gpu_need_gib "$weights_gib" "$kv_budget_gib" "$DEFAULT_RUNTIME_OVERHEAD_GIB" "$DEFAULT_MEMORY_MARGIN_GIB")
+
+  local gpu_util
+  gpu_util=$(calc_gpu_util_from_estimate "$vram_gib" "$weights_gib" "$kv_budget_gib" "$DEFAULT_RUNTIME_OVERHEAD_GIB" "$DEFAULT_MEMORY_MARGIN_GIB" "$DEFAULT_GPU_UTIL_MIN" "$DEFAULT_GPU_UTIL_MAX")
+
+  echo "[INFO] GPU_MEMORY_UTILIZATION selected=${gpu_util} (need=${gpu_need_gib} GiB, weights=${weights_gib} GiB, kv_budget=${kv_budget_gib} GiB, overhead=${DEFAULT_RUNTIME_OVERHEAD_GIB} GiB, margin=${DEFAULT_MEMORY_MARGIN_GIB} GiB, total=${vram_gib} GiB)"
+
   generate_env_file "$model" "$dtype" "$kv_dtype" "$quant" "$host" "$port" "$gpu_util" "$max_len" "$num_seqs" "$weights_gib" "$kv_gib" "$vram_gib" "$extra_args" "$model_type" "$architectures" "$has_mtp" "$raw_max_len" "$DEFAULT_RESERVED_VRAM_GIB" "$DEFAULT_KV_CACHE_GIB" "$kv_cache_bytes"
 }
 
@@ -398,7 +658,7 @@ generate_env() {
 # ------------------------------------------------------------
 if [[ $# -lt 1 ]]; then
   cat <<'HELP'
-auto_vllm_config.sh v6.7
+auto_vllm_config.sh v6.8
 -----------------------------------------------
 config.json の内容を最優先で dtype / quantization / kv-cache-dtype に反映。
 vLLM 非対応値 (fp16 など) は自動で警告・フォールバック。
@@ -416,6 +676,10 @@ MTP重みを検出した場合、--speculative-config method=mtp num_speculative
   VLLM_RESERVED_VRAM_GIB=32
   VLLM_KV_CACHE_GIB=8
   VLLM_AUTO_KV_CACHE_BYTES=1
+  VLLM_RUNTIME_OVERHEAD_GIB=6
+  VLLM_MEMORY_MARGIN_GIB=4
+  VLLM_GPU_UTIL_MIN=0.10
+  VLLM_GPU_UTIL_MAX=0.90
 
 出力:
   ${ENV_DIR}/<モデル名>.env

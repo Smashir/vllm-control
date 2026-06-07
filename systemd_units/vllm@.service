@@ -45,6 +45,9 @@ ARGS="--model ${MODEL_PATH:-} \
 --dtype ${DTYPE:-auto} --max-model-len ${MAX_MODEL_LEN:-8192} \
 --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.90} \
 --max-num-seqs ${MAX_NUM_SEQS:-8} --tensor-parallel-size ${TENSOR_PARALLEL_SIZE:-1}"; \
+if [[ -n "${SERVED_MODEL_NAME:-}" ]]; then \
+  ARGS="$ARGS --served-model-name ${SERVED_MODEL_NAME}"; \
+fi; \
 if [[ -n "${QUANTIZATION:-}" && "${QUANTIZATION:-None}" != "None" ]]; then \
   ARGS="$ARGS --quantization ${QUANTIZATION}"; \
 fi; \
